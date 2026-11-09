@@ -1,0 +1,76 @@
+{% extends "base.html" %}{% block content %}<div class="flex gap-4"><aside class="hidden md:block bg-slate-950 text-white rounded-xl p-5 w-48"><b>EcoDoria Admin</b><p class="mt-5">Overview</p><p>Reports</p><p>KYC</p><p>Wallet</p><p>Agencies</p><p>Layers</p><p>Settings</p></aside><section class="flex-1"><h1 class="text-3xl font-black">Operations dashboard</h1><div class="grid grid-cols-2 md:grid-cols-5 gap-3 my-5">{% for k,v in counts.items() %}<div class="bg-white rounded-xl shadow p-4"><p class="text-sm text-slate-500">{{k}}</p><b class="text-2xl">{{v}}</b></div>{% endfor %}</div><div class="grid md:grid-cols-2 gap-5"><div class="bg-white rounded-xl p-5"><h2 class="font-bold text-xl">Daraja Buy Goods payment prompt</h2><p class="text-sm text-slate-500">Production STK Push collection into the configured Till. This is not a wallet payout.</p><form method="post" action="/admin/daraja/stk-prompt" class="space-y-2 mt-3"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="phone" placeholder="07XXXXXXXX or 2547XXXXXXXX" class="border p-2 rounded w-full" required><input name="amount" type="number" min="1" max="250000" placeholder="Amount KES" class="border p-2 rounded w-full" required><input name="memo" placeholder="Payment purpose" class="border p-2 rounded w-full"><button class="bg-red-600 text-white p-3 rounded">Send M-Pesa prompt</button></form><p class="text-xs mt-2">Payment is only confirmed after Safaricom callback. Configure DARAJA_ENV, DARAJA_BUSINESS_SHORTCODE, DARAJA_PARTY_B, consumer key/secret, passkey and public HTTPS callback URL.</p></div><div class="bg-white rounded-xl p-5"><h2 class="font-bold text-xl">Manual wallet credit</h2><p class="text-sm text-slate-500">Prompt/credit any amount. This does not send money.</p><form method="post" action="/admin/wallet/credit" class="space-y-2 mt-3"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="phone" placeholder="Citizen phone" class="border p-2 rounded w-full"><input name="amount" type="number" min="1" placeholder="Amount KES" class="border p-2 rounded w-full"><input name="memo" placeholder="Reason / prompt" class="border p-2 rounded w-full"><button class="bg-green-700 text-white p-3 rounded">Credit wallet</button></form></div><div class="bg-white rounded-xl p-5"><h2 class="font-bold text-xl">KYC review queue</h2>{% for k in kycs %}<div class="border-b py-3"><b>{{k.county}}</b><p class="text-sm">Submitted {{k.created_at}}</p><a class="text-green-700" href="/admin/kyc-image/{{k.selfie_image_id}}">Selfie</a> · <a class="text-green-700" href="/admin/kyc-image/{{k.id_image_id}}">ID</a> · <a href="/admin/kyc-image/{{k.signature_image_id}}">Signature</a><form method="post" action="/admin/kyc/{{k._id}}/decision" class="mt-2"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" placeholder="Decision reason" class="border p-2"><button name="decision" value="Approve" class="bg-green-700 text-white p-2 rounded">Approve</button><button name="decision" value="Reject" class="bg-red-600 text-white p-2 rounded">Reject</button></form></div>{% else %}<p>No pending KYC.</p>{% endfor %}</div></div><div class="bg-white rounded-xl p-5 mt-5"><h2 class="font-bold text-xl">Daraja collections</h2>{% for t in stk_transactions %}<div class="border-b py-2 text-sm"><b>KES {{t.amount_kes}}</b> · {{t.phone}} · {{t.status}} · {{t.reference}} {% if t.mpesa_receipt %}· Receipt {{t.mpesa_receipt}} · <a class="text-green-700 underline" href="/admin/daraja/receipt/{{t._id}}">Print receipt</a>{% endif %}</div>{% else %}<p>No Daraja prompts yet.</p>{% endfor %}</div><div class="bg-white rounded-xl p-5 mt-5"><h2 class="font-bold text-xl">Latest reports</h2>{% for r in reports %}<div class="border-b py-3"><b>{{r.category}}</b> · {{r.county}} · {{r.status}} · {{r.priority}}<p class="text-sm">{{r.report_id}} · fraud {{r.fraud_score}} · spot verified {{r.spot_verified}}</p><img class="h-24 rounded" src="/img/{{r.photo_image_id}}"></div>{% endfor %}</div></section></div>
+
+<!-- Branded Daraja payment status dialog -->
+<div id="stk-modal" class="hidden fixed inset-0 z-50 bg-slate-950/70 p-4 items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="stk-title">
+ <div class="w-full max-w-md rounded-2xl bg-white shadow-2xl overflow-hidden">
+  <div class="p-6 text-center">
+   <img src="/static/images/ecodoria-logo.png" alt="EcoDoria" class="h-24 w-auto max-w-full object-contain mx-auto mb-3">
+   <p class="text-xs uppercase tracking-widest text-slate-500">Secure M-Pesa payment</p>
+   <h2 id="stk-title" class="text-2xl font-black mt-1">Sending payment prompt</h2>
+   <div id="stk-spinner" class="mx-auto my-5 h-10 w-10 rounded-full border-4 border-slate-200 border-t-green-600 animate-spin"></div>
+   <div id="stk-status-icon" class="hidden mx-auto my-4 text-4xl font-black"></div>
+   <p id="stk-message" class="text-slate-600">Please wait while we contact Safaricom.</p>
+   <div id="stk-meta" class="text-xs text-slate-500 mt-3"></div>
+   <button id="stk-close" type="button" class="hidden mt-6 w-full rounded-lg bg-slate-900 text-white p-3 font-semibold">Close</button>
+  </div>
+ </div>
+</div>
+<script>
+(()=>{
+ const form=document.querySelector('form[action="/admin/daraja/stk-prompt"]');
+ const modal=document.getElementById('stk-modal');
+ if(!form || !modal) return;
+ const title=document.getElementById('stk-title'), msg=document.getElementById('stk-message');
+ const spinner=document.getElementById('stk-spinner'), icon=document.getElementById('stk-status-icon');
+ const meta=document.getElementById('stk-meta'), close=document.getElementById('stk-close');
+ let pollTimer=null, pollCount=0, active=false;
+ const show=()=>{modal.classList.remove('hidden');modal.classList.add('flex');};
+ const finish=(state,message,receipt)=>{
+   active=false; clearTimeout(pollTimer); spinner.classList.add('hidden');
+   icon.classList.remove('hidden'); close.classList.remove('hidden');
+   const styles={Paid:['✓','text-green-600','Payment successful'],Cancelled:['×','text-amber-600','Payment cancelled'],Failed:['!','text-red-600','Payment failed']};
+   const v=styles[state]||['i','text-slate-600','Payment update'];
+   icon.textContent=v[0]; icon.className='mx-auto my-4 text-5xl font-black '+v[1];
+   title.textContent=v[2]; msg.textContent=message;
+   if(receipt) meta.textContent='Safaricom receipt: '+receipt;
+ };
+ close.addEventListener('click',()=>{modal.classList.add('hidden');modal.classList.remove('flex');});
+ form.addEventListener('submit',async ev=>{
+   ev.preventDefault(); if(active) return;
+   active=true; pollCount=0; title.textContent='Sending payment prompt';
+   msg.textContent='Contacting Safaricom. Please keep this window open.';
+   meta.textContent=''; icon.classList.add('hidden'); spinner.classList.remove('hidden'); close.classList.add('hidden'); show();
+   const submit=form.querySelector('button[type="submit"],button:not([type])');
+   if(submit) submit.disabled=true;
+   try{
+     const response=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{'X-Requested-With':'XMLHttpRequest'}});
+     const data=await response.json().catch(()=>({message:'Unexpected response from the server.'}));
+     if(!response.ok || !data.ok){finish('Failed',data.message||'The payment prompt could not be sent. Please try again.');return;}
+     title.textContent='Check your phone';
+     msg.textContent=data.message;
+     meta.textContent='Reference: '+(form.querySelector('[name="memo"]')?.value||'EcoDoria payment');
+     poll(data.txid);
+   }catch(err){finish('Failed','A connection error occurred while sending the prompt. Check your connection and try again.');}
+   finally{if(submit) submit.disabled=false;}
+ });
+ async function poll(id){
+   if(!active) return;
+   if(pollCount++>=60){
+     active=false; spinner.classList.add('hidden'); close.classList.remove('hidden');
+     title.textContent='Still awaiting confirmation';
+     msg.textContent='Safaricom has not sent a final response yet. Do not assume payment succeeded. Check the collections list shortly before retrying.';
+     return;
+   }
+   try{
+     const r=await fetch('/admin/daraja/status/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
+     const d=await r.json();
+     if(r.ok && d.ok){
+       if(['Paid','Cancelled','Failed'].includes(d.status)){finish(d.status,d.message,d.receipt);return;}
+       title.textContent='Waiting for M-Pesa confirmation'; msg.textContent=d.message;
+     }
+   }catch(e){msg.textContent='Temporarily unable to refresh status. We will keep checking.';}
+   pollTimer=setTimeout(()=>poll(id),2000);
+ }
+})();
+</script>
+\n{% endblock %}
