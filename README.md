@@ -28,7 +28,7 @@ ecodoria/
    python -c "import secrets; print(secrets.token_urlsafe(48))"
    ```
    Put the Fernet output in `ENCRYPTION_KEY`, a random secret in `FLASK_SECRET_KEY` and `CRON_SECRET`.
-5. Set Atlas `MONGODB_URI`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD`; run `python seed.py`.
+5. Set Atlas `MONGODB_URI`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` (or `ADMIN_PASSWORD_HASH`). Run `python seed.py` only if you want to pre-create the bootstrap administrator locally. On Vercel, the first successful admin login automatically creates the admin record after validating `ADMIN_EMAIL` and `ADMIN_PASSWORD_HASH`; you do not need to execute `seed.py` on Vercel.
 6. Start `flask --app app run` (set `FLASK_DEBUG=true` only locally).
 
 ## MongoDB Atlas
@@ -37,7 +37,7 @@ Create a free M0 cluster, database user and database `ecodoria`. In Network Acce
 ## Integrations
 - **Daraja production Buy Goods STK Push:** create a Safaricom Daraja app with Lipa na M-Pesa Online/STK Push enabled, complete Safaricom production go-live/onboarding, and use the production consumer key, consumer secret, production passkey and your active Buy Goods Till in `DARAJA_SHORTCODE`. Set `DARAJA_ENV=production`, `DARAJA_SHORTCODE_TYPE=buygoods`, and `DARAJA_CALLBACK_URL` to your public HTTPS callback base. The admin can initiate a customer-to-business STK prompt for a chosen phone and amount. The request uses `CustomerBuyGoodsOnline`; the customer must authorize with their M-Pesa PIN. The callback confirms payment asynchronously and records the M-Pesa receipt. An accepted STK request is not proof of payment. Buy Goods STK is for money collected into the Till; it is not B2C and does not pay citizen rewards. The app does not invoke B2C. Test a low-value payment and reconcile it in the merchant portal before production launch.
 - **Africa's Talking:** configure username, API key and sender ID for OTP and officer SMS. Without credentials SMS is logged.
-- **Resend:** configure API key and verified sender domain for email. Without credentials email is logged.
+- **SMTP email:** configure all five values: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_FROM`. Gmail users should use a Google App Password (not their normal account password) with `smtp.gmail.com` and port `587`. SMTP uses STARTTLS on port 587 and implicit TLS on port 465. If credentials are missing or delivery fails, the app logs the failure and does not report the email as sent.
 - **Vercel:** import repository, choose the Python runtime, and add the required `.env.example` variables in Project Settings → Environment Variables. Set a long random `CRON_SECRET` in Production (and Preview if needed). Native Vercel Cron sends `Authorization: Bearer <CRON_SECRET>` when that environment variable is configured; the cron endpoints accept this header and also retain `X-Cron-Secret` support for external schedulers. Cron endpoints accept GET as required by Vercel. The three daily maintenance jobs run at 02:00, 02:15 and 02:30 UTC; the weekly summary runs Mondays at 08:00 UTC. All schedules are compatible with Vercel Hobby's once-per-day frequency limit. If you need hourly escalation, use a Vercel plan that supports more frequent cron execution or an external scheduler.
 
 ## Wallet / receipts

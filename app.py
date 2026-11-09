@@ -21,6 +21,12 @@ from shapely.geometry import shape, Point, mapping
 from shapely.ops import transform
 from pyproj import Transformer
 import requests
+import smtplib
+import hmac
+from email.message import EmailMessage
+from email.utils import parseaddr
+from html import unescape
+from werkzeug.security import generate_password_hash
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -82,14 +88,41 @@ def send_sms(phone,msg):
         return r.ok
     except Exception: app.logger.exception("SMS failed"); return False
 def send_email(to,subject,html):
-    key=os.getenv("RESEND_API_KEY")
-    if not key:
-        app.logger.info("EMAIL (not sent) to %s: %s",to,subject); return False
+    """Send email through authenticated SMTP; never silently claim delivery."""
+    host=os.getenv("SMTP_HOST","").strip()
+    username=os.getenv("SMTP_USERNAME","").strip()
+    password=os.getenv("SMTP_PASSWORD","")
+    sender=os.getenv("SMTP_FROM","").strip()
     try:
-        r=requests.post("https://api.resend.com/emails",headers={"Authorization":"Bearer "+key},
-          json={"from":os.getenv("MAIL_FROM","EcoDoria <noreply@example.com>"),"to":[to],"subject":subject,"html":html},timeout=10)
-        return r.ok
-    except Exception: app.logger.exception("Email failed"); return False
+        port=int(os.getenv("SMTP_PORT","587"))
+    except ValueError:
+        app.logger.error("SMTP_PORT must be a valid integer")
+        return False
+    if not all((host,username,password,sender,to)):
+        app.logger.warning("Email not sent: SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM and recipient are required")
+        return False
+    try:
+        msg=EmailMessage()
+        msg["Subject"]=subject
+        msg["From"]=sender
+        msg["To"]=to
+        msg.set_content(re.sub(r"<[^>]+>"," ",unescape(html)).strip() or subject)
+        msg.add_alternative(html,subtype="html")
+        if port==465:
+            with smtplib.SMTP_SSL(host,port,timeout=15) as server:
+                server.login(username,password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=15) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(username,password)
+                server.send_message(msg)
+        return True
+    except Exception:
+        app.logger.exception("SMTP email delivery failed")
+        return False
 
 def create_indexes():
     """Run once at startup/deploy; safe to rerun."""
@@ -328,7 +361,25 @@ def admin_login_post():
     if not stored or email!=os.getenv("ADMIN_EMAIL","").lower() or not check_password_hash(stored,password):
         abort(401,"Invalid administrator credentials")
     u=col("users").find_one({"email":email,"role":"admin"})
-    if not u: abort(403,"Run seed.py to create the bootstrap administrator")
+    if not u:
+        # Secure first-login bootstrap: create the administrator only after the
+        # submitted credentials have matched the deployment's ADMIN_PASSWORD_HASH.
+        # This avoids requiring a shell/seed.py execution on Vercel.
+        try:
+            result=col("users").insert_one({
+                "email":email,
+                "password_hash":stored,
+                "role":"admin",
+                "tier":2,
+                "created_at":now(),
+                "bootstrap_admin":True
+            })
+            u=col("users").find_one({"_id":result.inserted_id})
+        except DuplicateKeyError:
+            u=col("users").find_one({"email":email,"role":"admin"})
+        if not u:
+            app.logger.error("Admin bootstrap failed for configured ADMIN_EMAIL")
+            abort(503,"Administrator account could not be initialized. Check MongoDB permissions and indexes.")
     session.clear(); session.update(uid=str(u["_id"]),role="admin")
     audit("admin_login",u["_id"])
     return redirect(url_for("admin"))
