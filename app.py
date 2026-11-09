@@ -31,6 +31,16 @@ from werkzeug.security import generate_password_hash
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 app=Flask(__name__)
+
+def admin_route():
+    route=(os.getenv("ADMIN_ROUTE") or "/your-private-admin-path").strip()
+    if not route.startswith("/"): route="/"+route
+    route=route.rstrip("/")
+    if not route or route=="/" or route=="/admin" or route.startswith("/admin/") or route.startswith("/officer/") or "<" in route or ">" in route:
+        raise RuntimeError("ADMIN_ROUTE must be a private, fixed URL path outside /admin and /officer, e.g. /your-private-admin-path")
+    return route
+
+ADMIN_ROUTE=admin_route()
 app.config.update(SECRET_KEY=os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32),
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE","true").lower()=="true",
                   SESSION_COOKIE_SAMESITE="Lax", MAX_CONTENT_LENGTH=8*1024*1024)
@@ -63,7 +73,8 @@ def require(*roles):
     def deco(fn):
         @wraps(fn)
         def wrapped(*a,**kw):
-            if not session.get("uid"): return redirect(url_for("login"))
+            if not session.get("uid"):
+                return redirect(ADMIN_ROUTE if "admin" in roles else url_for("login"))
             if roles and session.get("role") not in roles: abort(403)
             return fn(*a,**kw)
         return wrapped
@@ -135,6 +146,7 @@ def create_indexes():
     col("reports").create_index([("user_id",ASCENDING),("created_at",DESCENDING)])
     col("reports").create_index([("status",ASCENDING),("county",ASCENDING)])
     col("officers").create_index([("agency_id",ASCENDING),("counties",ASCENDING)])
+    col("officers").create_index("username",unique=True,sparse=True)
     col("routing_rules").create_index([("category",ASCENDING),("county",ASCENDING),("layer_type",ASCENDING)],unique=True)
     col("images").create_index([("owner_id",ASCENDING),("kind",ASCENDING)])
     col("payouts").create_index([("user_id",ASCENDING),("created_at",DESCENDING)])
@@ -199,14 +211,20 @@ def route_report(report):
     if not rule: return
     agency=col("agencies").find_one({"_id":rule["agency_id"]})
     if not agency: return
-    for officer in col("officers").find({"agency_id":agency["_id"],"counties":county}):
+    for officer in col("officers").find({"agency_id":agency["_id"],"counties":county,"active":{"$ne":False}}):
         token=secrets.token_urlsafe(32)
         col("officer_links").insert_one({"token_hash":hashlib.sha256(token.encode()).hexdigest(),
           "officer_id":officer["_id"],"report_id":report["_id"],"expires_at":now()+timedelta(hours=48),"used":False})
-        link=(os.getenv("PUBLIC_BASE_URL","https://example.com")+"/o/"+token)
-        send_sms(officer.get("phone",""),f"EcoDoria: new alleged {report['category']} report in {county}. Review: {link}")
-        if officer.get("email"): send_email(officer["email"],"New EcoDoria report",f'<p>New alleged report. <a href="{link}">Open securely</a></p>')
+        link=(os.getenv("PUBLIC_BASE_URL","https://example.com")+"/officer/"+officer["username"]) if officer.get("username") else ""
+        message=f"EcoDoria: new alleged {report['category']} report in {county}. Sign in at {link}" if link else f"EcoDoria: new report in {county}. Contact your administrator to activate your username login."
+        send_sms(officer.get("phone",""),message)
+        if officer.get("email") and link: send_email(officer["email"],"New EcoDoria report",f'<p>New report assigned to your zone. <a href="{link}">Sign in securely</a></p>')
     col("reports").update_one({"_id":report["_id"]},{"$set":{"agency_id":agency["_id"],"agency_name":agency["name"]}})
+
+@app.before_request
+def protect_admin_namespace():
+    if request.path.startswith("/admin") and session.get("role")!="admin":
+        return redirect(ADMIN_ROUTE)
 
 @app.before_request
 def ensure_db():
@@ -350,29 +368,20 @@ def admin_kyc_image(image_id):
     try: data=decrypt(im["bytes"])
     except InvalidToken: abort(500)
     return send_file(io.BytesIO(data),mimetype="image/jpeg")
-@app.get("/admin/login")
-def admin_login(): return render_template("admin_login.html",brand=brand())
-@app.post("/admin/login")
-@limiter.limit("5 per hour")
-def admin_login_post():
+def admin_login():
+    if request.method=="GET":
+        return render_template("admin_login.html",brand=brand())
     email=request.form.get("email","").lower().strip()
     password=request.form.get("password","")
     stored=os.getenv("ADMIN_PASSWORD_HASH","")
-    if not stored or email!=os.getenv("ADMIN_EMAIL","").lower() or not check_password_hash(stored,password):
+    if not stored or email!=os.getenv("ADMIN_EMAIL","").lower().strip() or not check_password_hash(stored,password):
         abort(401,"Invalid administrator credentials")
     u=col("users").find_one({"email":email,"role":"admin"})
     if not u:
-        # Secure first-login bootstrap: create the administrator only after the
-        # submitted credentials have matched the deployment's ADMIN_PASSWORD_HASH.
-        # This avoids requiring a shell/seed.py execution on Vercel.
         try:
             result=col("users").insert_one({
-                "email":email,
-                "password_hash":stored,
-                "role":"admin",
-                "tier":2,
-                "created_at":now(),
-                "bootstrap_admin":True
+                "email":email,"password_hash":stored,"role":"admin","tier":2,
+                "created_at":now(),"bootstrap_admin":True
             })
             u=col("users").find_one({"_id":result.inserted_id})
         except DuplicateKeyError:
@@ -384,6 +393,18 @@ def admin_login_post():
     audit("admin_login",u["_id"])
     return redirect(url_for("admin"))
 
+app.add_url_rule(ADMIN_ROUTE,endpoint="admin_login",view_func=admin_login,
+                 methods=["GET","POST"],defaults={},strict_slashes=False)
+app.view_functions["admin_login"]=limiter.limit("5 per hour")(app.view_functions["admin_login"])
+
+@app.post("/admin/login")
+@limiter.limit("5 per hour")
+def legacy_admin_login_disabled():
+    abort(404)
+@app.post("/admin/login/") 
+def legacy_admin_login_slash_disabled():
+    abort(404)
+
 @app.get("/admin")
 @require("admin")
 def admin():
@@ -392,7 +413,10 @@ def admin():
       "hotspots":col("hotspots").count_documents({})}
     return render_template("admin.html",counts=counts,kycs=list(col("kyc").find({"status":"Pending"}).limit(100)),
       reports=list(col("reports").find().sort("created_at",-1).limit(100)),
-      stk_transactions=list(col("stk_transactions").find().sort("created_at",-1).limit(50)),brand=brand())
+      stk_transactions=list(col("stk_transactions").find().sort("created_at",-1).limit(50)),
+      officers=list(col("officers").find().sort("username",1).limit(500)),
+      agencies=list(col("agencies").find({"active":{"$ne":False}}).sort("name",1)),
+      counties=list(col("counties").find({"active":True}).sort("name",1)),brand=brand())
 @app.post("/admin/kyc/<kid>/decision")
 @require("admin")
 def kyc_decision(kid):
@@ -404,6 +428,82 @@ def kyc_decision(kid):
     if decision=="Approve": col("users").update_one({"_id":k["user_id"]},{"$set":{"tier":1,"level":"Patroller","home_county":k["county"]}})
     audit("kyc_"+decision.lower(),kid,{"reason":reason})
     return redirect(url_for("admin"))
+
+
+def _valid_officer_username(value):
+    return bool(re.fullmatch(r"[a-z][a-z0-9]{2,15}",value or ""))
+
+def _officer_payload(form, existing=None):
+    username=(form.get("username") or "").strip().lower()
+    if not _valid_officer_username(username):
+        abort(400,"Username must be 3–16 characters: lowercase letters and numbers, starting with a letter.")
+    agency_id=oid(form.get("agency_id"))
+    agency=col("agencies").find_one({"_id":agency_id,"active":{"$ne":False}}) if agency_id else None
+    if not agency: abort(400,"Select a valid active agency.")
+    counties=[x.strip() for x in form.getlist("counties") if x.strip()]
+    valid={x["name"] for x in col("counties").find({"name":{"$in":counties},"active":True})}
+    if not counties or set(counties)!=valid:
+        abort(400,"Assign at least one valid active patrol county/zone.")
+    payload={"username":username,"name":(form.get("name") or username).strip()[:120],
+      "email":(form.get("email") or "").strip().lower()[:254],
+      "phone":(form.get("phone") or "").strip()[:30],"agency_id":agency["_id"],
+      "agency_name":agency["name"],"counties":counties,"updated_at":now()}
+    return payload
+
+@app.post("/admin/officers")
+@require("admin")
+@limiter.limit("30 per hour")
+def officer_create():
+    payload=_officer_payload(request.form)
+    password=request.form.get("password","")
+    if len(password)<12: abort(400,"Set an initial password of at least 12 characters.")
+    payload.update({"password_hash":generate_password_hash(password),"active":True,"created_at":now()})
+    try:
+        oid_new=col("officers").insert_one(payload).inserted_id
+    except DuplicateKeyError:
+        abort(409,"That officer username is already in use.")
+    audit("officer_created",oid_new,{"username":payload["username"],"counties":payload["counties"]})
+    flash("Officer account created.")
+    return redirect(url_for("admin"))
+
+@app.post("/admin/officers/<officer_id>/update")
+@require("admin")
+def officer_update(officer_id):
+    officer=col("officers").find_one({"_id":oid(officer_id)})
+    if not officer: abort(404)
+    payload=_officer_payload(request.form,officer)
+    try:
+        col("officers").update_one({"_id":officer["_id"]},{"$set":payload})
+    except DuplicateKeyError:
+        abort(409,"That officer username is already in use.")
+    audit("officer_updated",officer_id,{"username":payload["username"],"counties":payload["counties"]})
+    flash("Officer account updated.")
+    return redirect(url_for("admin"))
+
+@app.post("/admin/officers/<officer_id>/status")
+@require("admin")
+def officer_status(officer_id):
+    active=request.form.get("active")=="true"
+    result=col("officers").update_one({"_id":oid(officer_id)},{"$set":{"active":active,"updated_at":now()}})
+    if not result.matched_count: abort(404)
+    audit("officer_activated" if active else "officer_deactivated",officer_id)
+    flash("Officer account "+("activated." if active else "deactivated."))
+    return redirect(url_for("admin"))
+
+@app.post("/admin/officers/<officer_id>/reset-password")
+@require("admin")
+@limiter.limit("20 per hour")
+def officer_reset_password(officer_id):
+    password=request.form.get("password","")
+    if len(password)<12: abort(400,"New password must be at least 12 characters.")
+    result=col("officers").update_one({"_id":oid(officer_id)},{"$set":{
+      "password_hash":generate_password_hash(password),"password_reset_at":now(),"updated_at":now()}})
+    if not result.matched_count: abort(404)
+    audit("officer_password_reset",officer_id)
+    flash("Officer password reset.")
+    return redirect(url_for("admin"))
+
+
 def daraja_base():
     # Production is explicit; missing/invalid config falls back safely to sandbox.
     return "https://api.safaricom.co.ke" if os.getenv("DARAJA_ENV","sandbox").lower()=="production" else "https://sandbox.safaricom.co.ke"
@@ -591,33 +691,65 @@ def receipt(pid):
 @app.get("/o/<token>")
 @limiter.limit("20 per hour")
 def officer_magic(token):
+    # Old emailed magic links no longer authenticate officers. Resolve to their
+    # username login page and require their password.
     th=hashlib.sha256(token.encode()).hexdigest()
-    link=col("officer_links").find_one({"token_hash":th,"expires_at":{"$gt":now()},"used":False})
-    if not link: abort(403,"Expired or invalid officer link")
-    off=col("officers").find_one({"_id":link["officer_id"]})
-    session.clear(); session.update(uid=str(off["_id"]),role="officer",officer_id=str(off["_id"]))
-    col("officer_links").update_one({"_id":link["_id"]},{"$set":{"used":True}})
+    link=col("officer_links").find_one({"token_hash":th,"expires_at":{"$gt":now()}})
+    if not link: abort(404,"Officer sign-in link expired. Open your assigned username URL.")
+    off=col("officers").find_one({"_id":link["officer_id"],"active":{"$ne":False}})
+    if not off or not off.get("username"): abort(403,"Officer account is inactive or not configured.")
+    return redirect(url_for("officer_login",username=off["username"]))
+
+@app.route("/officer/<username>",methods=["GET","POST"])
+@limiter.limit("10 per hour")
+def officer_login(username):
+    username=username.strip().lower()
+    off=col("officers").find_one({"username":username})
+    if not off or off.get("active") is False: abort(404,"Officer login not found or account inactive.")
+    if request.method=="GET":
+        if session.get("role")=="officer" and session.get("officer_id")==str(off["_id"]):
+            return redirect(url_for("officer_dashboard"))
+        return render_template("officer_login.html",officer=off,brand=brand())
+    password=request.form.get("password","")
+    if not off.get("password_hash") or not check_password_hash(off["password_hash"],password):
+        abort(401,"Invalid officer username or password.")
+    session.clear()
+    session.update(uid=str(off["_id"]),role="officer",officer_id=str(off["_id"]))
+    audit("officer_login",off["_id"])
     return redirect(url_for("officer_dashboard"))
+
+def current_officer():
+    if session.get("role")!="officer" or session.get("uid")!=session.get("officer_id"):
+        abort(403,"Officer authentication required.")
+    off=col("officers").find_one({"_id":oid(session.get("officer_id")),"active":{"$ne":False}})
+    if not off: abort(403,"Officer account is inactive or unavailable.")
+    return off
+
 def officer_scope(officer):
-    return {"agency_id":officer["agency_id"],"county":{"$in":officer.get("counties",[])}}
+    counties=officer.get("counties",[])
+    if not counties: return {"_id":{"$exists":False}}
+    scope={"county":{"$in":counties}}
+    if officer.get("agency_id"): scope["agency_id"]=officer["agency_id"]
+    return scope
+
 @app.get("/officer")
 @require("officer")
 def officer_dashboard():
-    off=col("officers").find_one({"_id":oid(session["uid"])})
-    if not off: abort(403)
+    off=current_officer()
     reports=list(col("reports").find(officer_scope(off)).sort("created_at",-1).limit(200))
     audit("officer_dashboard_view",off["_id"])
-    return render_template("officer.html",reports=reports,brand=brand())
+    return render_template("officer.html",reports=reports,officer=off,brand=brand())
+
 @app.post("/officer/report/<rid>/decision")
 @require("officer")
 def officer_decision(rid):
-    off=col("officers").find_one({"_id":oid(session["uid"])})
+    off=current_officer()
     r=col("reports").find_one({"_id":oid(rid),**officer_scope(off)})
     if not r: abort(404)
     action=request.form.get("decision")
     if action not in ("Verified","Rejected","Non-compliant"): abort(400)
     status="Verified" if action in ("Verified","Non-compliant") else "Rejected"
-    col("reports").update_one({"_id":r["_id"]},{"$set":{"status":status,"officer_decision":action,
+    col("reports").update_one({"_id":r["_id"],**officer_scope(off)},{"$set":{"status":status,"officer_decision":action,
       "decision_reason":request.form.get("reason","")[:500],"verified_by":off["_id"],"verified_at":now()}})
     if status=="Verified":
         u=col("users").find_one({"_id":r["user_id"]})
@@ -633,17 +765,20 @@ def officer_decision(rid):
         if u and u.get("confirmed_reports",0)+1>=5: col("users").update_one({"_id":u["_id"]},{"$set":{"tier":2,"level":"Senior Patroller"}})
     audit("officer_"+action.lower(),rid)
     return redirect(url_for("officer_dashboard"))
+
 @app.post("/officer/report/<rid>/reassign")
 @require("officer")
 def officer_reassign(rid):
-    off=col("officers").find_one({"_id":oid(session["uid"])})
+    off=current_officer()
     r=col("reports").find_one({"_id":oid(rid),**officer_scope(off)})
     if not r: abort(404)
-    agency=col("agencies").find_one({"name":request.form.get("agency")})
+    agency=col("agencies").find_one({"name":request.form.get("agency"),"active":{"$ne":False}})
     if not agency: abort(400)
-    col("reports").update_one({"_id":r["_id"]},{"$set":{"agency_id":agency["_id"],"agency_name":agency["name"]}})
+    # Reassignment is limited to the officer's current assigned scope.
+    col("reports").update_one({"_id":r["_id"],**officer_scope(off)},{"$set":{"agency_id":agency["_id"],"agency_name":agency["name"]}})
     audit("report_reassigned",rid,{"agency":agency["name"]})
     return redirect(url_for("officer_dashboard"))
+
 # LEGAL TODO: the refund clause requires Kenyan legal review and ODPC registration before real launch.
 @app.get("/terms")
 def terms(): return render_template("legal.html",privacy=False,brand=brand())

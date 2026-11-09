@@ -79,3 +79,10 @@ Set these values in your deployment environment (do not commit real credentials)
 - `PUBLIC_BASE_URL`: the public HTTPS deployment URL. Safaricom must be able to reach the callback endpoint.
 
 The admin payment dialog reports **successful** only after a successful Safaricom callback. A customer cancellation is shown separately from a failed request. If no final callback arrives, the dialog remains unconfirmed; it never treats a prompt being accepted as proof of payment.
+
+
+## Private administrator and officer access
+- Set `ADMIN_ROUTE` to a private path such as `/your-private-admin-path` in Vercel Production and redeploy. The admin login is registered only at that path; `/admin/login` is disabled. All `/admin` pages and APIs require an authenticated `admin` role and redirect unauthenticated requests to `ADMIN_ROUTE`. Public navigation contains no admin/officer entry.
+- Officers are managed from the admin dashboard. Each account has a unique lowercase username (3–16 characters), password hash, active status, agency and assigned counties. Login is at `/officer/<username>`. An officer session is bound to that officer's MongoDB `_id`; changing a URL username cannot change the authenticated identity. Reports are queried and updated only inside that officer's assigned counties and agency.
+- Existing officer records are preserved. They remain unable to sign in until an administrator assigns a username, password and active status through Officer account management. Existing one-click `/o/<token>` links no longer authenticate; they resolve to the officer's password login page.
+- The application creates a unique sparse MongoDB index for officer usernames. If the officers collection already contains duplicate `username` values, resolve duplicates before deployment; legacy records without usernames are retained.
