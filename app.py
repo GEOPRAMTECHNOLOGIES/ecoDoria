@@ -598,29 +598,46 @@ def officer_reassign(rid):
 def terms(): return render_template("legal.html",privacy=False,brand=brand())
 @app.get("/privacy")
 def privacy(): return render_template("legal.html",privacy=True,brand=brand())
-@app.post("/api/cron/escalate")
+def _authorize_vercel_cron():
+    """Authenticate native Vercel Cron requests using CRON_SECRET.
+
+    Vercel sends: Authorization: Bearer <CRON_SECRET>.
+    X-Cron-Secret remains accepted for manually configured external schedulers.
+    """
+    secret=os.getenv("CRON_SECRET","").strip()
+    if not secret:
+        app.logger.error("CRON_SECRET is not configured; rejecting cron request")
+        abort(503, description="Cron authentication is not configured.")
+    authorization=request.headers.get("Authorization","")
+    bearer=authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    supplied=bearer or request.headers.get("X-Cron-Secret","")
+    if not supplied or not __import__("hmac").compare_digest(supplied,secret):
+        abort(403)
+
+
+@app.route("/api/cron/escalate", methods=["GET","POST"])
 @csrf.exempt
 def cron_escalate():
-    if request.headers.get("X-Cron-Secret")!=os.getenv("CRON_SECRET"): abort(403)
+    _authorize_vercel_cron()
     stale=list(col("reports").find({"status":"Pending","created_at":{"$lt":now()-timedelta(hours=48)},"escalated":{"$ne":True}}))
     for r in stale:
         send_email(os.getenv("ADMIN_EMAIL",""),"EcoDoria escalation",f"<p>Report {r['report_id']} remains pending in {r['county']}.</p>")
         col("reports").update_one({"_id":r["_id"]},{"$set":{"escalated":True,"escalated_at":now()}})
     return jsonify(escalated=len(stale))
-@app.post("/api/cron/hotspots")
+@app.route("/api/cron/hotspots", methods=["GET","POST"])
 @csrf.exempt
 def cron_hotspots():
-    if request.headers.get("X-Cron-Secret")!=os.getenv("CRON_SECRET"): abort(403)
+    _authorize_vercel_cron()
     col("hotspots").delete_many({})
     pipeline=[{"$match":{"status":{"$in":["Pending","Verified"]}}},{"$group":{"_id":{"county":"$county","lat":{"$floor":{"$arrayElemAt":["$location.coordinates",1]}},"lng":{"$floor":{"$arrayElemAt":["$location.coordinates",0]}}},"n":{"$sum":1}}},{"$match":{"n":{"$gte":3}}}]
     n=0
     for h in col("reports").aggregate(pipeline):
         col("hotspots").insert_one({"county":h["_id"]["county"],"count":h["n"],"location":{"type":"Point","coordinates":[h["_id"]["lng"]+.005,h["_id"]["lat"]+.005]},"created_at":now()}); n+=1
     return jsonify(hotspots=n)
-@app.post("/api/cron/kyc-retention")
+@app.route("/api/cron/kyc-retention", methods=["GET","POST"])
 @csrf.exempt
 def cron_kyc_retention():
-    if request.headers.get("X-Cron-Secret")!=os.getenv("CRON_SECRET"): abort(403)
+    _authorize_vercel_cron()
     cutoff=now()-timedelta(days=int(os.getenv("KYC_RETENTION_DAYS","30")))
     ks=list(col("kyc").find({"status":{"$in":["Approve","Reject"]},"decided_at":{"$lt":cutoff},"images_deleted":{"$ne":True}}))
     for k in ks:
@@ -628,10 +645,10 @@ def cron_kyc_retention():
             col("images").delete_one({"_id":k[field]})
         col("kyc").update_one({"_id":k["_id"]},{"$set":{"images_deleted":True,"encrypted_id_reference":k.get("id_number_encrypted")}})
     return jsonify(deleted=len(ks))
-@app.post("/api/cron/weekly-summary")
+@app.route("/api/cron/weekly-summary", methods=["GET","POST"])
 @csrf.exempt
 def cron_summary():
-    if request.headers.get("X-Cron-Secret")!=os.getenv("CRON_SECRET"): abort(403)
+    _authorize_vercel_cron()
     since=now()-timedelta(days=7); reports=col("reports").count_documents({"created_at":{"$gte":since}})
     paid=list(col("payouts").aggregate([{"$match":{"status":"Sent","created_at":{"$gte":since}}},{"$group":{"_id":None,"sum":{"$sum":"$amount_kes"}}}]))
     send_email(os.getenv("ADMIN_EMAIL",""),"EcoDoria weekly summary",f"<p>Reports: {reports}; rewards paid: {paid[0]['sum'] if paid else 0} KES.</p>")
